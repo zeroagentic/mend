@@ -68,7 +68,8 @@ type Edit = (tree: Tree) => void;
 type TextFile = { lines: string[]; br: string; final: boolean };
 function readText(text: string): TextFile {
   const lf = text.indexOf('\n');
-  const br = lf > 0 && text[lf - 1] === '\r' ? '\r\n' : '\n';
+  const br = lf >= 0 && text.slice(0, lf + 1).endsWith('\r\n') ? '\r\n' : '\n';
+  // AUDIT §3: an empty file has no lines and no final break; otherwise lines are pieces split at the file's break.
   const final = text !== '' && text.endsWith(br);
   const lines = text === '' ? [] : text.split(br);
   if (final) lines.pop();
@@ -119,11 +120,14 @@ type Body = { old: string[]; next: NewLine[]; noFinal: boolean; plus: string[]; 
 function bodyOf(body: string[]): Body {
   const old: string[] = [], next: NewLine[] = [], plus: string[] = [];
   let noFinal = false, plusNoFinal = false;
+  // AUDIT §6: an empty body line is a context line whose text is empty; a marker prefix is one character.
+  const textOf = (l: string): string => (l === '' ? '' : l.slice(1));
   for (let i = 0; i < body.length; i++) {
     const l = body[i];
+    // AUDIT §6: a `\` line refers to the body line before it, and controls only the final break.
     const mark = body[i + 1]?.startsWith('\\') ?? false;
     if (l === '' || l.startsWith(' ')) {
-      const text = l.slice(1);
+      const text = textOf(l);
       next.push({ text, context: old.length });
       old.push(text);
       noFinal = mark;
@@ -183,15 +187,19 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   };
   for (let i = 0; i < lines.length;) {
     const l = lines[i];
-    // AUDIT §6: malformed git headers and every malformed/orphan @@ report their own line.
+    // AUDIT §6: any line starting `diff --git` that is not of the a/X b/Y form faults on its own line.
     if (l.startsWith('diff --git')) {
       const m = /^diff --git a\/(.+) b\/(.+)$/.exec(l);
       if (!m) parseAt(i + 1);
       section = start(m[1], m[2]);
       i++;
     } else if (l.startsWith('--- ')) {
-      // AUDIT §6: an unpaired --- reports the following line, even beyond patch EOF.
-      if (!(lines[i + 1] ?? '').startsWith('+++ ')) parseAt(i + 2);
+      // AUDIT §6: the unpaired --- error is scoped to a section's header; outside one the line is ignored.
+      if (!(lines[i + 1] ?? '').startsWith('+++ ')) {
+        if (section && !section.hunks.length) parseAt(i + 2);
+        i++;
+        continue;
+      }
       if (!section || section.pair || section.hunks.length) section = start(null, null);
       section.old = unifiedPath(l);
       section.next = unifiedPath(lines[i + 1]);
@@ -291,10 +299,19 @@ function searchEdits(lines: string[], strict: boolean): Edit[] {
     if (p === null) parseAt(start + 1);
     let middle = i + 1;
     // AUDIT §7: marker comparisons remove trailing whitespace only; missing ordered delimiters name SEARCH.
-    while (middle < lines.length && lines[middle].trimEnd() !== '=======') middle++;
-    let end = middle + 1;
-    while (end < lines.length && lines[end].trimEnd() !== '>>>>>>> REPLACE') end++;
-    if (middle >= lines.length || end >= lines.length) parseAt(start + 1);
+    // A following SEARCH marker bounds the scan so one block cannot borrow another's separators.
+    const bound = (from: number, want: string): number => {
+      for (let j = from; j < lines.length; j++) {
+        if (lines[j].trimEnd() === want) return j;
+        if (want === '=======' && lines[j].trimEnd() === '<<<<<<< SEARCH') return -1;
+      }
+      return -1;
+    };
+    const eq = bound(i + 1, '=======');
+    if (eq < 0) parseAt(start + 1);
+    middle = eq;
+    const end = bound(eq + 1, '>>>>>>> REPLACE');
+    if (end < 0) parseAt(start + 1);
     const old = lines.slice(i + 1, middle), next = lines.slice(middle + 1, end);
     edits.push((tree) => {
       safePaths(p);
