@@ -318,6 +318,95 @@ function searchEdits(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
+type Chunk = { anchor: string; eof: boolean; body: Body };
+function v4aEdits(lines: string[], strict: boolean): Edit[] {
+  const first = lines.findIndex((l) => !blank(l));
+  // AUDIT §8: Begin/End alone are trimmed; bad Begin names its line, bad End names patch-line-count+1.
+  if (first < 0) parseAt(1);
+  if (lines[first].trim() !== '*** Begin Patch') parseAt(first + 1);
+  let last = lines.length - 1;
+  while (last >= first && blank(lines[last])) last--;
+  if (lines[last].trim() !== '*** End Patch') parseAt(lines.length + 1);
+  const header = (l: string) => /^\*\*\* (Add|Delete|Update) File: (.*)$/.exec(l);
+  const edits: Edit[] = [];
+  for (let i = first + 1; i < last;) {
+    if (blank(lines[i])) { i++; continue; }
+    const h = header(lines[i]);
+    if (!h) parseAt(i + 1);
+    const sectionLine = i + 1, kind = h[1], p = trimSpaces(h[2]);
+    const begin = ++i;
+    while (i < last && !header(lines[i])) i++;
+    let end = i;
+    // AUDIT §8: blank tails between sections are ignored, including space/tab-only lines.
+    while (end > begin && blank(lines[end - 1])) end--;
+    if (kind === 'Add') {
+      const add: string[] = [];
+      for (let j = begin; j < end; j++) {
+        if (lines[j] !== '' && !lines[j].startsWith('+')) parseAt(j + 1);
+        add.push(lines[j].slice(1));
+      }
+      edits.push((tree) => {
+        safePaths(p);
+        create(tree, p, writeText({ lines: add, br: '\n', final: true }));
+      });
+    } else if (kind === 'Delete') {
+      // AUDIT §8: Delete has no body; Add permits only plus-prefixed or raw empty lines.
+      if (end > begin) parseAt(begin + 1);
+      edits.push((tree) => {
+        safePaths(p);
+        existing(tree, p);
+        tree.now.set(p, null);
+      });
+    } else {
+      let j = begin, move: string | null = null;
+      // AUDIT §8: Move to is accepted only as the update's first line and may stand without chunks.
+      if (j < end && lines[j].startsWith('*** Move to: ')) move = trimSpaces(lines[j++].slice(13));
+      const chunks: Chunk[] = [];
+      while (j < end) {
+        let anchor = '';
+        if (lines[j].startsWith('@@')) anchor = trimSpaces(lines[j++].slice(2));
+        else if (chunks.length || (lines[j] !== '' && !' -+'.includes(lines[j][0]))) parseAt(j + 1);
+        const body: string[] = [];
+        while (j < end && (lines[j] === '' || ' -+'.includes(lines[j][0]))) body.push(lines[j++]);
+        let eof = false;
+        if (j < end && lines[j] === '*** End of File') { eof = true; j++; }
+        chunks.push({ anchor, eof, body: bodyOf(body) });
+        // AUDIT §8: after the first implicit chunk, chunks need @@; every other internal line is a parse fault.
+        if (j < end && !lines[j].startsWith('@@')) parseAt(j + 1);
+      }
+      if (!chunks.length && move === null) parseAt(sectionLine);
+      edits.push((tree) => {
+        safePaths(p, move);
+        const f = readText(existing(tree, p));
+        if (move !== null && tree.get(move) !== null) throw new Fail('exists', move);
+        let cursor = 0;
+        for (const c of chunks) {
+          // AUDIT §8: anchor matching is tiered independently, restricted to the cursor, and skips its line.
+          if (c.anchor !== '') cursor = locate([c.anchor], f.lines, strict, p, (at) => at >= cursor).positions[0] + 1;
+          const b = c.body;
+          let at = c.eof ? f.lines.length : cursor, tier = 0;
+          if (b.old.length) {
+            const found = locate(b.old, f.lines, strict, p,
+              (pos) => pos >= cursor && (!c.eof || pos + b.old.length === f.lines.length));
+            at = found.positions[0];
+            tier = found.tier;
+          }
+          // AUDIT §8: EOF restricts matches, empty O inserts at cursor/EOF, and cursor follows written lines.
+          const next = replacement(b, f.lines, at, tier);
+          replaceLines(f, at, b.old.length, next);
+          cursor = at + next.length;
+        }
+        tree.now.set(move ?? p, writeText(f));
+        if (move !== null) {
+          tree.now.set(p, null);
+          tree.moves.push([p, move]);
+        }
+      });
+    }
+  }
+  return edits;
+}
+
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
@@ -448,7 +537,7 @@ function run(args: string[]): { code: number; out: string[] } {
   let edits: Edit[];
   try {
     edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict)
-      : kind === 'search-replace' ? searchEdits(lines, strict) : [];
+      : kind === 'search-replace' ? searchEdits(lines, strict) : kind === 'v4a' ? v4aEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
