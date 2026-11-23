@@ -44,6 +44,7 @@ function safe(p: string): boolean {
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
+  readonly moves: [string, string][] = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -62,6 +63,217 @@ class Tree {
 }
 
 type Edit = (tree: Tree) => void;
+
+// AUDIT §3: first LF determines the file break; an empty file has no lines or final break.
+type TextFile = { lines: string[]; br: string; final: boolean };
+function readText(text: string): TextFile {
+  const lf = text.indexOf('\n');
+  const br = lf > 0 && text[lf - 1] === '\r' ? '\r\n' : '\n';
+  const final = text !== '' && text.endsWith(br);
+  const lines = text === '' ? [] : text.split(br);
+  if (final) lines.pop();
+  return { lines, br, final };
+}
+// AUDIT §3: no lines serialize empty; edits retain the current break and final-break flag.
+function writeText(f: TextFile): string {
+  return f.lines.length ? f.lines.join(f.br) + (f.final ? f.br : '') : '';
+}
+const trimSpaces = (s: string): string => s.replace(/^ +| +$/g, '');
+const indent = (s: string): string => /^[ \t]*/.exec(s)![0];
+const normalize = (s: string, tier: number): string =>
+  tier === 0 ? s : tier === 1 ? s.replace(/[ \t]+$/, '') : s.replace(/^[ \t]+|[ \t]+$/g, '');
+
+// AUDIT §5: KMP returns every occurrence, including overlaps, in linear line comparisons.
+function matches(old: string[], lines: string[], tier: number): number[] {
+  if (!old.length) return [];
+  const pattern = old.map((s) => normalize(s, tier));
+  const prefix = new Array<number>(pattern.length).fill(0);
+  for (let i = 1, j = 0; i < pattern.length; i++) {
+    while (j > 0 && pattern[i] !== pattern[j]) j = prefix[j - 1];
+    if (pattern[i] === pattern[j]) j++;
+    prefix[i] = j;
+  }
+  const found: number[] = [];
+  for (let i = 0, j = 0; i < lines.length; i++) {
+    const line = normalize(lines[i], tier);
+    while (j > 0 && line !== pattern[j]) j = prefix[j - 1];
+    if (line === pattern[j]) j++;
+    if (j === pattern.length) {
+      found.push(i + 1 - j);
+      j = prefix[j - 1];
+    }
+  }
+  return found;
+}
+// AUDIT §5/8: choose the first tier with an eligible occurrence; strict tries tier zero only.
+function locate(old: string[], lines: string[], strict: boolean, p: string,
+  eligible: (at: number) => boolean = () => true): { tier: number; positions: number[] } {
+  for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
+    const positions = matches(old, lines, tier).filter(eligible);
+    if (positions.length) return { tier, positions };
+  }
+  throw new Fail('no-match', p);
+}
+type NewLine = { text: string; context: number | null };
+type Body = { old: string[]; next: NewLine[]; noFinal: boolean; plus: string[]; plusNoFinal: boolean };
+function bodyOf(body: string[]): Body {
+  const old: string[] = [], next: NewLine[] = [], plus: string[] = [];
+  let noFinal = false, plusNoFinal = false;
+  for (let i = 0; i < body.length; i++) {
+    const l = body[i];
+    const mark = body[i + 1]?.startsWith('\\') ?? false;
+    if (l === '' || l.startsWith(' ')) {
+      const text = l.slice(1);
+      next.push({ text, context: old.length });
+      old.push(text);
+      noFinal = mark;
+    } else if (l.startsWith('-')) old.push(l.slice(1));
+    else if (l.startsWith('+')) {
+      next.push({ text: l.slice(1), context: null });
+      plus.push(l.slice(1));
+      noFinal = mark;
+      plusNoFinal = mark;
+    }
+  }
+  return { old, next, noFinal, plus, plusNoFinal };
+}
+// AUDIT §5: contexts use the matched file bytes at every tier; only additions re-indent at tier 2.
+function replacement(body: Body, lines: string[], at: number, tier: number): string[] {
+  const p = body.old.length ? indent(body.old[0]) : '';
+  const f = body.old.length ? indent(lines[at]) : '';
+  return body.next.map((n) => {
+    if (n.context !== null) return lines[at + n.context];
+    if (tier === 2 && !blank(n.text) && n.text.startsWith(p)) return f + n.text.slice(p.length);
+    return n.text;
+  });
+}
+function replaceLines(f: TextFile, at: number, count: number, next: string[]): void {
+  f.lines = f.lines.slice(0, at).concat(next, f.lines.slice(at + count));
+}
+function safePaths(...paths: (string | null)[]): void {
+  // AUDIT §10: all named paths are checked before existence or matching; null is /dev/null only.
+  for (const p of paths) if (p !== null && !safe(p)) throw new Fail('unsafe', p);
+}
+function existing(tree: Tree, p: string): string {
+  const text = tree.get(p);
+  if (text === null) throw new Fail('missing', p);
+  return text;
+}
+function create(tree: Tree, p: string, text: string): void {
+  if (tree.get(p) !== null) throw new Fail('exists', p);
+  tree.now.set(p, text);
+}
+const parseAt = (n: number): never => { throw new Exit2(`error: parse ${n}`); };
+
+type Hunk = { a: number; body: Body };
+type UnifiedSection = {
+  old: string | null; next: string | null; pair: boolean; creation: boolean; deletion: boolean; hunks: Hunk[];
+};
+function unifiedPath(line: string): string | null {
+  const p = trimSpaces(line.slice(4).split('\t', 1)[0]);
+  return p === '/dev/null' ? null : p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p;
+}
+function unifiedEdits(lines: string[], strict: boolean): Edit[] {
+  const sections: UnifiedSection[] = [];
+  let section: UnifiedSection | null = null;
+  const start = (old: string | null, next: string | null): UnifiedSection => {
+    const s = { old, next, pair: false, creation: false, deletion: false, hunks: [] };
+    sections.push(s);
+    return s;
+  };
+  for (let i = 0; i < lines.length;) {
+    const l = lines[i];
+    // AUDIT §6: malformed git headers and every malformed/orphan @@ report their own line.
+    if (l.startsWith('diff --git')) {
+      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(l);
+      if (!m) parseAt(i + 1);
+      section = start(m[1], m[2]);
+      i++;
+    } else if (l.startsWith('--- ')) {
+      // AUDIT §6: an unpaired --- reports the following line, even beyond patch EOF.
+      if (!(lines[i + 1] ?? '').startsWith('+++ ')) parseAt(i + 2);
+      if (!section || section.pair || section.hunks.length) section = start(null, null);
+      section.old = unifiedPath(l);
+      section.next = unifiedPath(lines[i + 1]);
+      section.pair = true;
+      i += 2;
+    } else if (l.startsWith('@@')) {
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+      if (!m || !section) parseAt(i + 1);
+      const a = Number(m[1]);
+      const body: string[] = [];
+      i++;
+      // AUDIT §6: counts B/D are ignored; headers or non-body lines end a body, raw trailing empties vanish.
+      while (i < lines.length) {
+        const b = lines[i];
+        if (b.startsWith('diff --git ') || (b.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ '))) break;
+        if (b !== '' && !' -+\\'.includes(b[0])) break;
+        body.push(b);
+        i++;
+      }
+      while (body.length && body[body.length - 1] === '') body.pop();
+      section.hunks.push({ a, body: bodyOf(body) });
+    } else {
+      // AUDIT §6: pair paths outrank rename paths, which outrank git paths; metadata/prose are ignored.
+      if (section && !section.hunks.length) {
+        if (!section.pair && l.startsWith('rename from ')) section.old = trimSpaces(l.slice(12));
+        if (!section.pair && l.startsWith('rename to ')) section.next = trimSpaces(l.slice(10));
+        if (l.startsWith('new file mode')) section.creation = true;
+        if (l.startsWith('deleted file mode')) section.deletion = true;
+      }
+      i++;
+    }
+  }
+  return sections.map((s): Edit => (tree) => {
+    safePaths(s.old, s.next);
+    if (s.old === null || s.creation) {
+      const p = s.next ?? '';
+      safePaths(p);
+      const added: string[] = [];
+      let noFinal = false;
+      // AUDIT §6: creation uses only + lines, with the marker on the last + controlling its final break.
+      for (const h of s.hunks) {
+        for (const line of h.body.plus) added.push(line);
+        if (h.body.plus.length) noFinal = h.body.plusNoFinal;
+      }
+      create(tree, p, writeText({ lines: added, br: '\n', final: !noFinal }));
+      return;
+    }
+    const p = s.old;
+    if (s.next === null || s.deletion) {
+      // AUDIT §6: deletion checks existence but does not match any hunk.
+      existing(tree, p);
+      tree.now.set(p, null);
+      return;
+    }
+    const text = existing(tree, p);
+    if (s.next !== p && tree.get(s.next) !== null) throw new Fail('exists', s.next);
+    const f = readText(text);
+    let d = 0;
+    for (const h of s.hunks) {
+      const b = h.body;
+      let at: number, tier = 0;
+      if (!b.old.length) at = Math.max(0, Math.min(f.lines.length, h.a + d));
+      else {
+        const found = locate(b.old, f.lines, strict, p);
+        tier = found.tier;
+        at = found.positions[0];
+        // AUDIT §6: nearest A-1+d wins, ties retain the earlier occurrence; empty O uses A+d.
+        for (const pos of found.positions) if (Math.abs(pos - (h.a - 1 + d)) < Math.abs(at - (h.a - 1 + d))) at = pos;
+      }
+      const next = replacement(b, f.lines, at, tier);
+      // AUDIT §6: only a hunk reaching EOF overrides the final break, using the last context/+ marker.
+      if (at + b.old.length === f.lines.length) f.final = !b.noFinal;
+      replaceLines(f, at, b.old.length, next);
+      d += next.length - b.old.length;
+    }
+    tree.now.set(s.next, writeText(f));
+    if (p !== s.next) {
+      tree.now.set(p, null);
+      tree.moves.push([p, s.next]);
+    }
+  });
+}
 
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
@@ -192,7 +404,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
@@ -212,20 +424,34 @@ function run(args: string[]): { code: number; out: string[] } {
     }
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
-  const rows: string[] = [];
-  for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    const was = tree.original(p);
-    const now = tree.now.get(p)!;
-    if (was === now) continue;
-    rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+  const changed = [...tree.now.keys()].filter((p) => tree.original(p) !== tree.get(p));
+  const rows = new Map<string, string>();
+  for (const p of changed) rows.set(p, `${tree.original(p) === null ? 'A' : tree.get(p) === null ? 'D' : 'M'} ${p}`);
+  // AUDIT §2: only successful, qualifying original-to-final move pairs replace D/A and sort by destination.
+  const paired = new Set<string>();
+  for (const [old, next] of tree.moves) {
+    if (!paired.has(old) && !paired.has(next) && tree.original(old) !== null && tree.get(old) === null &&
+        tree.original(next) === null && tree.get(next) !== null) {
+      rows.delete(old);
+      rows.set(next, `R ${old} -> ${next}`);
+      paired.add(old);
+      paired.add(next);
     }
   }
-  return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
+  // AUDIT §10: no writes precede complete validation; --check has identical output without writing.
+  if (!check) {
+    for (const p of changed) if (tree.get(p) === null) rmSync(p, { force: true });
+    for (const p of changed) {
+      const now = tree.get(p);
+      if (now !== null) {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, now);
+      }
+    }
+  }
+  // AUDIT §2: UTF-8 byte sorting, no unchanged paths, singular only for one output row (R counts once).
+  const out = [...rows.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))).map((p) => rows.get(p)!);
+  return { code: 0, out: [...out, `ok: ${out.length} ${out.length === 1 ? 'file' : 'files'}`] };
 }
 
 
