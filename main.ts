@@ -275,6 +275,49 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   });
 }
 
+function searchEdits(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  let previous: string | null = null, candidate: string | null = null;
+  for (let i = 0; i < lines.length;) {
+    const marker = lines[i].trimEnd();
+    if (marker !== '<<<<<<< SEARCH') {
+      // AUDIT §7: nearest nonblank, non-fence path since the previous block wins, otherwise reuse its path.
+      if (!blank(lines[i]) && !lines[i].trim().startsWith('```')) candidate = lines[i].trim();
+      i++;
+      continue;
+    }
+    const start = i;
+    const p = candidate ?? previous;
+    if (p === null) parseAt(start + 1);
+    let middle = i + 1;
+    // AUDIT §7: marker comparisons remove trailing whitespace only; missing ordered delimiters name SEARCH.
+    while (middle < lines.length && lines[middle].trimEnd() !== '=======') middle++;
+    let end = middle + 1;
+    while (end < lines.length && lines[end].trimEnd() !== '>>>>>>> REPLACE') end++;
+    if (middle >= lines.length || end >= lines.length) parseAt(start + 1);
+    const old = lines.slice(i + 1, middle), next = lines.slice(middle + 1, end);
+    edits.push((tree) => {
+      safePaths(p);
+      // AUDIT §7: empty old creates; a nonempty old must occur exactly once at its first matching tier.
+      if (!old.length) {
+        create(tree, p, writeText({ lines: next, br: '\n', final: true }));
+        return;
+      }
+      const f = readText(existing(tree, p));
+      const found = locate(old, f.lines, strict, p);
+      if (found.positions.length !== 1) throw new Fail('ambiguous', p);
+      const at = found.positions[0];
+      const body: Body = { old, next: next.map((text) => ({ text, context: null })), plus: [], noFinal: false, plusNoFinal: false };
+      replaceLines(f, at, old.length, replacement(body, f.lines, at, found.tier));
+      tree.now.set(p, writeText(f));
+    });
+    previous = p;
+    candidate = null;
+    i = end + 1;
+  }
+  return edits;
+}
+
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
@@ -404,7 +447,8 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict)
+      : kind === 'search-replace' ? searchEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
